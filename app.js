@@ -8,12 +8,21 @@
  *   GET /g?a=&i=&f=                  save general settings
  *   GET /reboot
  * The Nano serves one request at a time, so requests here are strictly sequential.
+ *
+ * Uptime history (24h / 7d / 30d, daily bars, incidents) comes straight from the
+ * healthchecks.io API: GET /api/v3/checks/<uuid>/flips/ with a READ-ONLY API key.
+ * The key is stored only in this browser (localStorage), never on the Nano or GitHub.
  */
 (function () {
   'use strict';
 
   var REFRESH_MS = 5000;
-  var state = { data: null, error: null, busy: false, lastOk: 0, timer: null };
+  var HISTORY_MS = 10 * 60 * 1000;
+  var HC_API = 'https://healthchecks.io/api/v3/checks/';
+  var KEY_STORE = 'lw_hc_ro_key';
+  var DAY = 86400000;
+  var state = { data: null, error: null, busy: false, lastOk: 0, timer: null,
+                hist: {}, histErr: null, histAt: 0, histLoading: false };
 
   // ---------- styles ----------
   var css = [
@@ -50,7 +59,7 @@
     '.kv div{font-size:13px;color:var(--muted)}.kv b{display:block;color:var(--text);font-size:15px}',
     '.banner{background:var(--down-bg);color:var(--down);padding:10px 14px;border-radius:10px;margin-bottom:14px;font-size:14px}',
     'label{display:block;font-size:13px;color:var(--muted);margin:12px 0 4px}',
-    'input[type=text],input[type=number]{width:100%;padding:9px 10px;border:1px solid var(--line);border-radius:8px;',
+    'input[type=text],input[type=number],input[type=password]{width:100%;padding:9px 10px;border:1px solid var(--line);border-radius:8px;',
     'background:var(--bg);color:var(--text);font:14px ui-monospace,Menlo,monospace}',
     'input:focus{outline:2px solid var(--accent);outline-offset:-1px}',
     '.hint{font-size:12px;color:var(--muted);margin-top:4px}',
@@ -66,6 +75,15 @@
     'dialog h3{margin:0 0 4px}',
     '.err{color:var(--down);font-size:13px;margin-top:10px;min-height:1em}',
     'footer{margin-top:28px;color:var(--muted);font-size:12px;text-align:center}',
+    '.up3{display:flex;gap:16px;margin-top:12px;font-size:13px;color:var(--muted)}',
+    '.up3 b{display:block;color:var(--text);font-size:15px}',
+    '.bars{display:flex;gap:2px;margin-top:8px;height:16px}',
+    '.bars i{flex:1;border-radius:2px;background:var(--off-bg)}',
+    '.bars i.g{background:var(--up)}.bars i.a{background:var(--warn)}.bars i.r{background:var(--down)}',
+    '.muted{color:var(--muted);font-size:13px;margin-top:10px}',
+    '.inc{display:flex;justify-content:space-between;gap:12px;padding:9px 0;border-bottom:1px solid var(--line);font-size:14px}',
+    '.inc:last-child{border-bottom:0}.inc .when{color:var(--muted);font-size:13px}',
+    '.inc .dur{font-weight:600;white-space:nowrap}.inc .dur.on{color:var(--down)}',
     '.toast{position:fixed;left:50%;bottom:20px;transform:translateX(-50%);background:var(--text);color:var(--bg);',
     'padding:10px 16px;border-radius:10px;font-size:14px;opacity:0;transition:opacity .2s;pointer-events:none}',
     '.toast.show{opacity:1}'
@@ -124,6 +142,9 @@
     state.busy = true;
     return request('/api').then(function (r) { return r.json(); }).then(function (d) {
       state.data = d; state.error = null; state.lastOk = Date.now();
+      if (getKey() && !state.histLoading && !state.histErr && watchedUuids(d).some(function (u) { return !(u in state.hist); })) {
+        setTimeout(loadHistory, 0);
+      }
     }).catch(function (e) {
       state.error = e.message || 'error';
     }).then(function () {
@@ -145,6 +166,144 @@
       return request(url).then(function () { state.busy = false; }, function (e) { state.busy = false; throw e; });
     }
     return go();
+  }
+
+  // ---------- uptime history (healthchecks.io API) ----------
+  function getKey() { try { return localStorage.getItem(KEY_STORE) || ''; } catch (e) { return ''; } }
+  function setKey(k) {
+    try { if (k) localStorage.setItem(KEY_STORE, k); else localStorage.removeItem(KEY_STORE); } catch (e) { /* ignore */ }
+  }
+
+  function watchedUuids(d) {
+    var list = [];
+    if (d.a) list.push(d.a);
+    (d.t || []).forEach(function (t) { if (t.h && list.indexOf(t.h) < 0) list.push(t.h); });
+    return list;
+  }
+
+  // Fetch the full flip history of every watched check. Flips come newest first;
+  // they are stored oldest first as {t: ms, up: 0|1}.
+  function loadHistory() {
+    var d = state.data, key = getKey();
+    if (!d || !key || state.histLoading) return Promise.resolve();
+    state.histLoading = true;
+    var uuids = watchedUuids(d);
+    return Promise.all(uuids.map(function (u) {
+      return fetch(HC_API + u + '/flips/', { headers: { 'X-Api-Key': key }, cache: 'no-store' }).then(function (r) {
+        if (r.status === 401) throw new Error('invalid API key');
+        if (r.status === 404) return { uuid: u, flips: null };
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        return r.json().then(function (j) {
+          var f = (j.flips || []).map(function (x) { return { t: Date.parse(x.timestamp), up: x.up ? 1 : 0 }; });
+          f.sort(function (a, b) { return a.t - b.t; });
+          return { uuid: u, flips: f };
+        });
+      });
+    })).then(function (res) {
+      var h = {};
+      res.forEach(function (x) { h[x.uuid] = x.flips; });
+      state.hist = h; state.histErr = null; state.histAt = Date.now();
+    }).catch(function (e) {
+      state.histErr = e.message || 'error';
+    }).then(function () {
+      state.histLoading = false;
+      render();
+    });
+  }
+
+  // Uptime over [a, b] from a flip list. Returns {pct, from} or null when there is no data.
+  // History starts at the oldest flip (the check's first "new -> up" transition).
+  function uptimeRange(flips, a, b) {
+    if (!flips || !flips.length || b <= flips[0].t) return null;
+    if (a < flips[0].t) a = flips[0].t;
+    var s = flips[0].up, i = 0;
+    while (i < flips.length && flips[i].t <= a) { s = flips[i].up; i++; }
+    var down = 0, cur = a;
+    for (; i < flips.length && flips[i].t < b; i++) {
+      if (!s) down += flips[i].t - cur;
+      cur = flips[i].t; s = flips[i].up;
+    }
+    if (!s) down += b - cur;
+    return { pct: 100 * (1 - down / (b - a)), from: a };
+  }
+
+  function pctText(u) {
+    if (!u) return '—';
+    if (u.pct >= 99.995) return '100%';
+    return (Math.floor(u.pct * 100) / 100).toFixed(2) + '%';
+  }
+
+  // Down periods {start, end|null} from a flip list, newest first.
+  function incidents(flips) {
+    var out = [], start = null;
+    (flips || []).forEach(function (f) {
+      if (!f.up && start === null) start = f.t;
+      else if (f.up && start !== null) { out.push({ start: start, end: f.t }); start = null; }
+    });
+    if (start !== null) out.push({ start: start, end: null });
+    return out.reverse();
+  }
+
+  function fmtDate(ms) {
+    var d = new Date(ms);
+    return d.toLocaleDateString(undefined, { day: 'numeric', month: 'short' }) + ' ' +
+      d.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' });
+  }
+
+  // "Uptime 24h / 7d / 30d" + 30 daily bars for one check.
+  function uptimeBlock(uuid) {
+    if (!getKey()) return el('div', { class: 'muted', text: 'Uptime: add a read-only API key in Settings' });
+    if (!uuid) return el('div', { class: 'muted', text: 'Uptime: no healthchecks UUID for this device' });
+    if (state.histErr) return el('div', { class: 'muted', text: 'Uptime: ' + state.histErr });
+    if (!(uuid in state.hist)) return el('div', { class: 'muted', text: 'Uptime: loading…' });
+    var f = state.hist[uuid];
+    if (!f) return el('div', { class: 'muted', text: 'Uptime: check not found in this healthchecks project' });
+    var now = Date.now();
+    var u1 = uptimeRange(f, now - DAY, now), u7 = uptimeRange(f, now - 7 * DAY, now), u30 = uptimeRange(f, now - 30 * DAY, now);
+    var since = u30 && u30.from > now - 30 * DAY + 60000 ? ' (since ' + fmtDate(u30.from) + ')' : '';
+    var bars = el('div', { class: 'bars' });
+    var today = new Date(); today.setHours(0, 0, 0, 0);
+    for (var k = 29; k >= 0; k--) {
+      var a = today.getTime() - k * DAY, b = Math.min(a + DAY, now);
+      var u = uptimeRange(f, a, b);
+      var cls = !u ? '' : (u.pct >= 99.995 ? 'g' : (u.pct >= 95 ? 'a' : 'r'));
+      bars.appendChild(el('i', { class: cls, title: new Date(a).toLocaleDateString() + ': ' + (u ? pctText(u) : 'no data') }));
+    }
+    return el('div', null, [
+      el('div', { class: 'up3' }, [
+        el('div', null, ['Uptime 24h', el('b', { text: pctText(u1) })]),
+        el('div', null, ['7 days', el('b', { text: pctText(u7) })]),
+        el('div', null, ['30 days', el('b', { text: pctText(u30) })])
+      ]),
+      bars,
+      since ? el('div', { class: 'hint', text: 'History' + since }) : null
+    ]);
+  }
+
+  function incidentsCard(d) {
+    var rows = [];
+    var now = Date.now();
+    var named = [];
+    if (d.a) named.push({ name: 'Internet (alive check)', uuid: d.a });
+    (d.t || []).forEach(function (t) { if (t.h) named.push({ name: t.n, uuid: t.h }); });
+    named.forEach(function (x) {
+      incidents(state.hist[x.uuid]).forEach(function (i) {
+        if ((i.end || now) > now - 30 * DAY) rows.push({ name: x.name, start: i.start, end: i.end });
+      });
+    });
+    rows.sort(function (a, b) { return b.start - a.start; });
+    var card = el('div', { class: 'card' });
+    if (!rows.length) {
+      card.appendChild(el('div', { class: 'muted', style: 'margin:0', text: 'No outages in the last 30 days.' }));
+      return card;
+    }
+    rows.slice(0, 15).forEach(function (r) {
+      card.appendChild(el('div', { class: 'inc' }, [
+        el('div', null, [el('div', { text: r.name }), el('div', { class: 'when', text: fmtDate(r.start) + (r.end ? ' → ' + fmtDate(r.end) : '') })]),
+        el('div', { class: 'dur' + (r.end ? '' : ' on'), text: r.end ? duration((r.end - r.start) / 1000) : 'ongoing ' + duration((now - r.start) / 1000) })
+      ]));
+    });
+    return card;
   }
 
   // ---------- rendering ----------
@@ -170,11 +329,20 @@
         el('div', null, [s.cls === 'down' ? 'Down for' : 'Fails', el('b', { text: extra })]),
         el('div', null, ['Healthchecks', el('b', { text: hcText(t.hr, !!t.h) })])
       ]),
+      uptimeBlock(t.h),
       el('button', { class: 'edit', text: 'Edit', onclick: function () { openDevice(t); } })
     ]);
   }
 
+  // Re-rendering replaces the inputs, so never do it while the user is typing in one.
+  function typing() {
+    var a = document.activeElement;
+    return !!(a && a.tagName === 'INPUT' && root.contains(a));
+  }
+
   function render() {
+    if (typing()) { state.pendingRender = true; return; }
+    state.pendingRender = false;
     var d = state.data;
     root.innerHTML = '';
     if (state.error) {
@@ -213,9 +381,21 @@
       el('div', null, ['Net self-repairs', el('b', { text: d.nf + ' fixes / ' + d.rd + ' DHCP' })]),
       el('div', null, ['Check cycles', el('b', { text: String(d.cy) })])
     ]));
+    if (d.a) {
+      root.appendChild(el('div', { class: 'card', style: 'margin-top:12px' }, [
+        el('div', { class: 'sub', style: 'margin:0', text: 'Internet uptime (from the "alive" check — also drops on LAN/power loss)' }),
+        uptimeBlock(d.a)
+      ]));
+    }
+
+    if (getKey()) {
+      root.appendChild(el('h2', { text: 'Incidents (30 days)' }));
+      root.appendChild(state.histErr ? el('div', { class: 'card muted', text: 'Cannot load history: ' + state.histErr }) : incidentsCard(d));
+    }
 
     root.appendChild(el('h2', { text: 'Settings' }));
     root.appendChild(settingsCard(d));
+    root.appendChild(keyCard());
 
     root.appendChild(el('footer', {
       text: 'Updated ' + new Date(state.lastOk).toLocaleTimeString() + ' · LAN only (plain HTTP)'
@@ -248,6 +428,33 @@
         el('button', { class: 'b primary', text: 'Save', onclick: save }),
         el('span', { class: 'spacer' }),
         el('button', { class: 'b danger', text: 'Reboot', onclick: reboot })
+      ])
+    ]);
+  }
+
+  function keyCard() {
+    var has = !!getKey();
+    var k = el('input', { type: 'password', autocomplete: 'off', placeholder: has ? 'saved in this browser (hidden)' : 'hcr_…' });
+    var err = el('div', { class: 'err' });
+    function save() {
+      var v = k.value.trim();
+      err.textContent = '';
+      if (!/^[A-Za-z0-9_-]{32}$/.test(v)) { err.textContent = 'An API key is 32 characters (read-only keys start with hcr_).'; return; }
+      setKey(v); state.hist = {}; state.histErr = null;
+      toast('Key saved in this browser');
+      loadHistory();
+    }
+    function remove() { setKey(''); state.hist = {}; state.histErr = null; toast('Key removed'); render(); }
+    return el('div', { class: 'card', style: 'margin-top:12px' }, [
+      el('label', { style: 'margin-top:0', text: 'healthchecks.io read-only API key (for uptime history)' }), k,
+      el('div', { class: 'hint', text: 'healthchecks.io → your project → Settings → API Access → create a READ-ONLY key. ' +
+        'It is stored only in this browser — each phone/computer needs it once.' }),
+      err,
+      el('div', { class: 'btns' }, [
+        el('button', { class: 'b primary', text: 'Save key', onclick: save }),
+        has ? el('button', { class: 'b ghost', text: 'Remove key', onclick: remove }) : null,
+        el('span', { class: 'spacer' }),
+        has && state.histAt ? el('span', { class: 'hint', text: 'History updated ' + new Date(state.histAt).toLocaleTimeString() }) : null
       ])
     ]);
   }
@@ -322,10 +529,14 @@
     root = el('div', { class: 'wrap' });
     dialog = el('dialog');
     toastEl = el('div', { class: 'toast' });
+    root.addEventListener('focusout', function () {
+      setTimeout(function () { if (state.pendingRender && !typing()) render(); }, 0);
+    });
     document.body.appendChild(root);
     document.body.appendChild(dialog);
     document.body.appendChild(toastEl);
-    load().then(schedule);
+    load().then(function () { schedule(); loadHistory(); });
+    setInterval(function () { if (!document.hidden) loadHistory(); }, HISTORY_MS);
     document.addEventListener('visibilitychange', function () { if (!document.hidden) load(); });
   }
 
