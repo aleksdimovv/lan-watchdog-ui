@@ -388,6 +388,18 @@
       ]));
     }
 
+    if (d.bc !== undefined) {
+      root.appendChild(el('h2', { text: 'Device health' }));
+      root.appendChild(el('div', { class: 'card kv' }, [
+        el('div', null, ['Boots (total)', el('b', { text: String(d.bc) })]),
+        el('div', null, ['Hang resets (watchdog)', el('b', { text: String(d.bw), style: d.bw ? 'color:var(--warn)' : '' })]),
+        el('div', null, ['Brown-outs (power dips)', el('b', { text: String(d.bb), style: d.bb ? 'color:var(--warn)' : '' })]),
+        el('div', null, ['Planned reboots', el('b', { text: String(d.bp) })]),
+        el('div', null, ['Last reset cause', el('b', { text: resetCause(d.lf) })]),
+        el('div', null, ['W5500 resets / SPI faults', el('b', { text: d.hr + ' / ' + d.sf, style: d.sf ? 'color:var(--warn)' : '' })])
+      ]));
+    }
+
     if (getKey()) {
       root.appendChild(el('h2', { text: 'Incidents (30 days)' }));
       root.appendChild(state.histErr ? el('div', { class: 'card muted', text: 'Cannot load history: ' + state.histErr }) : incidentsCard(d));
@@ -400,6 +412,17 @@
     root.appendChild(el('footer', {
       text: 'Updated ' + new Date(state.lastOk).toLocaleTimeString() + ' · LAN only (plain HTTP)'
     }));
+  }
+
+  // AVR MCUSR bits recorded at boot: PORF=1, EXTRF=2, BORF=4, WDRF=8.
+  function resetCause(f) {
+    if (!f) return 'unknown';
+    var c = [];
+    if (f & 1) c.push('power-on');
+    if (f & 2) c.push('reset/upload');
+    if (f & 4) c.push('brown-out');
+    if (f & 8) c.push('watchdog');
+    return c.join(' + ') || 'unknown';
   }
 
   function settingsCard(d) {
