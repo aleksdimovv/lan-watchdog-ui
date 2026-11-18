@@ -388,6 +388,11 @@
       ]));
     }
 
+    if (d.ol !== undefined) {
+      root.appendChild(el('h2', { text: 'Internet outages' }));
+      root.appendChild(outagesCard(d));
+    }
+
     if (d.bc !== undefined) {
       root.appendChild(el('h2', { text: 'Device health' }));
       root.appendChild(el('div', { class: 'card kv' }, [
@@ -414,6 +419,51 @@
     }));
   }
 
+  // Internet outages detected by the watchdog itself (alive ping fails 2x in a row).
+  // d.ol = [[startEpoch, durationSec], ...] newest first; d.io = start of an ongoing one.
+  function outagesCard(d) {
+    var now = Date.now() / 1000;
+    function dur(sec) {               // outage durations: keep the seconds
+      sec = Math.round(sec);
+      var h = Math.floor(sec / 3600), m = Math.floor(sec % 3600 / 60), x = sec % 60;
+      return h ? h + 'h ' + m + 'm' : (m ? m + 'm ' + x + 's' : x + 's');
+    }
+    var list = d.ol || [];
+    function stats(win) {
+      var from = now - win, n = 0, sum = 0;
+      list.forEach(function (o) {
+        var s = o[0], e = o[0] + o[1];
+        if (e > from) { n++; sum += e - Math.max(s, from); }
+      });
+      return n ? n + ' · ' + dur(sum) : 'none';
+    }
+    var card = el('div', { class: 'card' });
+    if (d.io) {
+      card.appendChild(el('div', { class: 'banner', text: 'Internet is DOWN' + (d.io > 1 ? ' since ' + fmtDate(d.io * 1000) + ' (' + dur(now - d.io) + ')' : '') }));
+    }
+    card.appendChild(el('div', { class: 'kv' }, [
+      el('div', null, ['Last 24 hours', el('b', { text: stats(86400) })]),
+      el('div', null, ['Last 7 days', el('b', { text: stats(7 * 86400) })]),
+      el('div', null, ['Last 30 days', el('b', { text: stats(30 * 86400) })]),
+      el('div', null, ['Logged in total', el('b', { text: String(list.length) })])
+    ]));
+    if (!list.length) {
+      card.appendChild(el('div', { class: 'muted', text: 'No internet outages recorded yet.' }));
+    } else {
+      var box = el('div', { style: 'margin-top:12px' });
+      list.slice(0, 15).forEach(function (o) {
+        box.appendChild(el('div', { class: 'inc' }, [
+          el('div', { class: 'when', text: fmtDate(o[0] * 1000) + ' → ' + fmtDate((o[0] + o[1]) * 1000) }),
+          el('div', { class: 'dur', text: dur(o[1]) })
+        ]));
+      });
+      card.appendChild(box);
+    }
+    card.appendChild(el('div', { class: 'hint', text: 'Detected by the watchdog (alive ping every ' + d.iv + ' s, accuracy about ±' + d.iv +
+      ' s). It counts when 2 pings in a row fail. The last 40 outages are kept on the device and survive restarts.' }));
+    return card;
+  }
+
   // AVR MCUSR bits recorded at boot: PORF=1, EXTRF=2, BORF=4, WDRF=8.
   function resetCause(f) {
     if (!f) return 'unknown';
@@ -427,13 +477,16 @@
 
   function settingsCard(d) {
     var a = el('input', { type: 'text', maxlength: '36', value: d.a, placeholder: 'empty = disabled' });
+    var ru = d.ru !== undefined ? el('input', { type: 'text', maxlength: '36', value: d.ru, placeholder: 'empty = no Telegram report' }) : null;
     var iv = el('input', { type: 'number', min: '10', max: '3600', value: d.iv });
     var ft = el('input', { type: 'number', min: '1', max: '20', value: d.ft });
     var err = el('div', { class: 'err' });
     function save() {
       err.textContent = '';
       if (a.value && !/^[0-9a-fA-F-]{36}$/.test(a.value)) { err.textContent = 'UUID must be 36 characters.'; return; }
-      var q = '/g?a=' + encodeURIComponent(a.value.trim()) + '&i=' + (+iv.value) + '&f=' + (+ft.value);
+      if (ru && ru.value && !/^[0-9a-fA-F-]{36}$/.test(ru.value.trim())) { err.textContent = 'Report UUID must be 36 characters.'; return; }
+      var q = '/g?a=' + encodeURIComponent(a.value.trim()) + '&i=' + (+iv.value) + '&f=' + (+ft.value) +
+        (ru ? '&o=' + encodeURIComponent(ru.value.trim()) : '');
       write(q).then(function () { toast('Saved'); load(); }, function (e) { err.textContent = 'Error: ' + e.message; });
     }
     function reboot() {
@@ -442,6 +495,8 @@
     }
     return el('div', { class: 'card' }, [
       el('label', { text: 'Healthchecks UUID — "alive" check' }), a,
+      ru ? el('label', { text: 'Healthchecks UUID — "Internet outage report" check' }) : null, ru,
+      ru ? el('div', { class: 'hint', text: 'After each internet outage the watchdog sends this check a /fail with "Internet was DOWN for …", then an OK — Telegram shows the text.' }) : null,
       el('div', { class: 'row' }, [
         el('div', null, [el('label', { text: 'Check interval (seconds)' }), iv]),
         el('div', null, [el('label', { text: 'Fails before DOWN' }), ft])
